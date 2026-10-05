@@ -221,3 +221,12 @@ test("shells without a saved bar config still persist inline settings", () => {
   assert.equal(savedEntry().barDisks, "nvme1n1:used");
   assert.equal(widget.settings.graphWidth, 48);
 });
+
+test("the memory list sorts by PSS and falls back to RSS until it arrives", () => {
+  const procs = [{ name: "chromium", mem: 2200, pss: 1200 }, { name: "quickshell", mem: 680, pss: 590 },
+    { name: "firefox", mem: 1300 }];
+  assert.deepEqual(plain(model.filterProcesses(procs, "", "pss").map(p => p.name)),
+    ["firefox", "chromium", "quickshell"]);
+  assert.deepEqual(plain(model.filterProcesses(procs, "", "mem").map(p => p.name)),
+    ["chromium", "firefox", "quickshell"]);
+});

@@ -367,6 +367,7 @@ function processSortValue(item, key) {
   if (!item) return 0
   if (key === "io") return num(item.read) + num(item.write)
   if (key === "net") return num(item.rx) + num(item.tx)
+  if (key === "pss") return num(item.pss !== undefined ? item.pss : item.mem)
   return num(item[key])
 }
 

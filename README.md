@@ -195,6 +195,13 @@ from the kernel's per-socket TCP byte counters (the same ones `ss -ti` shows),
 differenced once a second and tied to processes through `/proc`, so it needs no
 root. UDP, and therefore QUIC, carries no such counters and is not attributed.
 
+While the Memory page is open, its process list shows proportional set size
+(PSS) instead of summed RSS, so an app made of many processes is charged for
+its shared libraries once rather than once per process. PSS comes from
+`/proc/<pid>/smaps_rollup`, read every 3 s and never while the panel is closed
+or on another page. Processes owned by other users cannot be read without root
+and keep their RSS; rows that include them are dimmed.
+
 IPC:
 
 ```bash

@@ -12,6 +12,9 @@ const PROCESS_SCAN_LIMIT: usize = 16_384;
 const FD_SCAN_LIMIT: usize = 4096;
 const PROC_FILE_LIMIT: u64 = 64 * 1024;
 const SOCKET_SCAN_LIMIT: usize = 16_384;
+/// Proportional set sizes cost a page-table walk per process, so they are
+/// refreshed this often while the Memory page is open, and never otherwise.
+const PSS_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 struct Prev {
@@ -28,6 +31,9 @@ struct Group {
     read: f64,
     write: f64,
     count: u32,
+    /// PSS where readable, RSS otherwise (another user's process).
+    pss: u64,
+    pss_count: u32,
 }
 
 pub struct ProcessSampler {
@@ -39,6 +45,15 @@ pub struct ProcessSampler {
     names: HashMap<u32, String>,
     sockets_prev: HashMap<String, (u64, u64)>,
     sockets_time: Option<Instant>,
+    pss: HashMap<u32, u64>,
+    pss_time: Option<Instant>,
+}
+
+/// The "Pss:" line of /proc/<pid>/smaps_rollup, in bytes.
+fn parse_pss(rollup: &str) -> Option<u64> {
+    let line = rollup.lines().find_map(|l| l.strip_prefix("Pss:"))?;
+    let kb: u64 = line.split_whitespace().next()?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// A readable name for a process: the kernel's 15-character comm, or the
@@ -74,12 +89,16 @@ impl ProcessSampler {
             names: HashMap::new(),
             sockets_prev: HashMap::new(),
             sockets_time: None,
+            pss: HashMap::new(),
+            pss_time: None,
         }
     }
 
     pub fn reset(&mut self) {
         self.prev.clear();
         self.names.clear();
+        self.pss.clear();
+        self.pss_time = None;
     }
 
     fn read_small(&mut self, path: &str) -> Option<&[u8]> {
@@ -94,7 +113,16 @@ impl ProcessSampler {
         Some(&self.buffer)
     }
 
-    pub fn sample(&mut self, elapsed: f64, full: bool) -> Value {
+    /// With `pss`, groups also carry their proportional set size: shared pages
+    /// split between the processes mapping them, so a multi-process app is not
+    /// charged for its shared libraries once per process the way summed RSS is.
+    pub fn sample(&mut self, elapsed: f64, full: bool, pss: bool) -> Value {
+        let refresh_pss = pss && self.pss_time.is_none_or(|t| t.elapsed() >= PSS_INTERVAL);
+        if !pss {
+            self.pss.clear();
+            self.pss_time = None;
+        }
+        let mut pss_now: HashMap<u32, u64> = HashMap::new();
         let mut current: HashMap<u32, Prev> = HashMap::new();
         let mut groups: HashMap<String, Group> = HashMap::new();
         let mut names: HashMap<u32, String> = HashMap::new();
@@ -180,6 +208,17 @@ impl ProcessSampler {
                 None => display_name(pid, &comm),
             };
             names.insert(pid, display.clone());
+            let measured = if refresh_pss {
+                self.read_small(&format!("/proc/{pid}/smaps_rollup"))
+                    .and_then(|b| parse_pss(&String::from_utf8_lossy(b)))
+            } else if pss {
+                self.pss.get(&pid).copied()
+            } else {
+                None
+            };
+            if let Some(v) = measured {
+                pss_now.insert(pid, v);
+            }
             let group = groups.entry(display.clone()).or_insert_with(|| Group {
                 name: display,
                 pid,
@@ -188,22 +227,37 @@ impl ProcessSampler {
                 read: 0.0,
                 write: 0.0,
                 count: 0,
+                pss: 0,
+                pss_count: 0,
             });
             group.cpu += cpu.max(0.0);
             group.mem += rss;
             group.read += io_read;
             group.write += io_write;
             group.count += 1;
+            group.pss += measured.unwrap_or(rss);
+            group.pss_count += measured.is_some() as u32;
         }
         self.prev = current;
         self.names = names;
+        if pss {
+            self.pss = pss_now;
+            if refresh_pss {
+                self.pss_time = Some(Instant::now());
+            }
+        }
 
         let mut list: Vec<&Group> = groups.values().collect();
         let to_json = |g: &Group| {
-            json!({
+            let mut v = json!({
                 "name": g.name, "pid": g.pid, "count": g.count,
                 "cpu": round1(g.cpu), "mem": g.mem, "read": g.read, "write": g.write,
-            })
+            });
+            if pss {
+                v["pss"] = json!(g.pss);
+                v["pssCount"] = json!(g.pss_count);
+            }
+            v
         };
 
         list.sort_by(|a, b| {
@@ -222,11 +276,12 @@ impl ProcessSampler {
             .take_while(|g| g.cpu > 0.0)
             .map(|g| to_json(g))
             .collect();
-        list.sort_by_key(|group| std::cmp::Reverse(group.mem));
+        let resident = |g: &Group| if pss { g.pss } else { g.mem };
+        list.sort_by_key(|group| std::cmp::Reverse(resident(group)));
         let mem: Vec<Value> = list
             .iter()
             .take(PROC_LIMIT)
-            .take_while(|g| g.mem > 0)
+            .take_while(|g| resident(g) > 0)
             .map(|g| to_json(g))
             .collect();
         list.sort_by(|a, b| {
@@ -244,6 +299,9 @@ impl ProcessSampler {
         let mut out = json!({ "cpu": cpu, "mem": mem, "io": io, "total": groups.len() });
         if let Some(all) = all {
             out["all"] = Value::Array(all);
+        }
+        if pss {
+            out["pss"] = Value::Bool(true);
         }
         out
     }
@@ -472,5 +530,35 @@ fn cgroup_label(cgroup: &str) -> String {
         "other".to_string()
     } else {
         bounded_text(stem, EXTERNAL_TEXT_LIMIT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pss_is_read_from_the_rollup_in_bytes() {
+        let rollup = "55d0c-7ffd0 ---p 00000000 00:00 0    [rollup]\nRss:              468120 kB\nPss:              343208 kB\nPss_Anon:         300000 kB\n";
+        assert_eq!(parse_pss(rollup), Some(343_208 * 1024));
+        assert_eq!(parse_pss("Rss: 12 kB\n"), None);
+    }
+
+    #[test]
+    fn own_processes_carry_pss_only_when_asked() {
+        let mut sampler = ProcessSampler::new();
+        let plain = sampler.sample(1.0, true, false);
+        assert!(plain.get("pss").is_none());
+        assert!(plain["all"][0].get("pss").is_none());
+        let with = sampler.sample(1.0, true, true);
+        assert_eq!(with["pss"], true);
+        // The test process itself is always readable.
+        let mine = with["all"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["pssCount"].as_u64() > Some(0))
+            .expect("at least one readable process");
+        assert!(mine["pss"].as_u64().unwrap() > 0);
     }
 }

@@ -14,6 +14,9 @@ Column {
   property var allItems: []
   property int total: 0
   // [{ key: "cpu", kind: "percent" | "bytes" | "rate" | "count", title: "" }]
+  // Optional: `fallback`, a key read when `key` is missing; `partialKey`, a
+  // count of exactly measured processes that dims the figure when it is short
+  // of the row's process count.
   property var columns: [{ key: "cpu", kind: "percent", title: "" }]
   // Key the unfolded list sorts by; "io" means read + write.
   property string sortKey: columns.length > 0 ? String(columns[0].key) : "cpu"
@@ -37,6 +40,7 @@ Column {
 
   function figure(item, column) {
     var raw = item ? item[column.key] : undefined
+    if (raw === undefined && item && column.fallback) raw = item[column.fallback]
     if (column.kind === "percent") return Model.percentParts(raw)
     if (column.kind === "count") return { value: String(Math.round(Model.num(raw))), unit: "" }
     if (column.kind === "rate") {
@@ -44,6 +48,11 @@ Column {
       return Model.rateParts(raw)
     }
     return Model.bytesParts(raw)
+  }
+
+  function partial(item, column) {
+    if (!item || !column.partialKey || item[column.partialKey] === undefined) return false
+    return Model.num(item[column.partialKey]) < Model.num(item.count, 1)
   }
 
   function setExpanded(value) {
@@ -225,7 +234,7 @@ Column {
               foreground: root.foreground
               fontFamily: root.fontFamily
               bold: false
-              valueOpacity: 0.9
+              valueOpacity: root.partial(procRow.proc, cell.modelData) ? 0.45 : 0.9
             }
           }
         }

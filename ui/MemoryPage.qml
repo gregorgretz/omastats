@@ -26,6 +26,8 @@ Column {
 
   readonly property var mem: snap.mem || ({})
   readonly property var procs: snap.procs || null
+  // The sampler adds proportional set sizes while this page is open.
+  readonly property bool hasPss: !!(procs && procs.pss)
   readonly property real total: Math.max(1, Model.num(mem.total, 1))
   readonly property real usedPercent: Model.num(mem.used) / total * 100
   readonly property real pressure: Math.max(Model.num(mem.pressureSome), Model.num(mem.pressureFull))
@@ -183,7 +185,9 @@ Column {
       items: root.procs ? (root.procs.mem || []) : []
       allItems: root.procs ? (root.procs.all || []) : []
       total: root.procs ? Model.num(root.procs.total) : 0
-      columns: [{ key: "mem", kind: "bytes", title: "" }]
+      columns: [root.hasPss
+        ? { key: "pss", fallback: "mem", partialKey: "pssCount", kind: "bytes", title: "PSS" }
+        : { key: "mem", kind: "bytes", title: "" }]
       emptyText: root.procs ? "Nothing resident" : "Measuring…"
       foreground: root.foreground
       fontFamily: root.fontFamily

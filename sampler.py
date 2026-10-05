@@ -6,7 +6,8 @@ sysfs directly (no psutil) so the only dependency is a Python 3 interpreter.
 
 Control lines on stdin:
     detail 0|1|2    0 = none, 1 = top processes, 2 = every process
-    focus <page>    page the panel shows; "network" adds per-process traffic
+    focus <page>    page the panel shows; "network" adds per-process traffic,
+                    "memory" adds per-process PSS (refreshed every 3 s)
     interval <sec>  change the sampling interval (0.1 - 30)
     pubip           refresh the public IP address in the background
 
@@ -1389,6 +1390,31 @@ def sample_battery() -> dict | None:
 # ----------------------------------------------------------------------- Processes
 
 
+# Proportional set sizes cost a page-table walk per process, so they are
+# refreshed this often while the Memory page is open, and never otherwise.
+PSS_INTERVAL = 3.0
+
+
+def parse_pss(rollup: str) -> int | None:
+    """The "Pss:" line of /proc/<pid>/smaps_rollup, in bytes."""
+    for line in rollup.splitlines():
+        if line.startswith("Pss:"):
+            fields = line[4:].split()
+            return int(fields[0]) * 1024 if fields and fields[0].isdigit() else None
+    return None
+
+
+def read_pss(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "rb") as handle:
+            raw = handle.read(PROC_FILE_LIMIT + 1)
+    except OSError:
+        return None
+    if len(raw) > PROC_FILE_LIMIT:
+        return None
+    return parse_pss(raw.decode("utf-8", "replace"))
+
+
 def display_name(pid: int, comm: str) -> str:
     """A readable name: the kernel's 15-char comm, or the executable's basename."""
     if len(comm) < 15:
@@ -1409,12 +1435,25 @@ class ProcessSampler:
         self.names: dict[int, str] = {}
         self.sockets_prev: dict[str, tuple[int, int]] = {}
         self.sockets_time: float | None = None
+        self.pss: dict[int, int] = {}
+        self.pss_time: float | None = None
 
     def reset(self) -> None:
         self.prev = {}
         self.names = {}
+        self.pss = {}
+        self.pss_time = None
 
-    def sample(self, elapsed: float, full: bool = False) -> dict:
+    def sample(self, elapsed: float, full: bool = False, pss: bool = False) -> dict:
+        """With `pss`, groups also carry their proportional set size: shared
+        pages split between the processes mapping them, so a multi-process app
+        is not charged for its shared libraries once per process the way summed
+        RSS is."""
+        refresh_pss = pss and (self.pss_time is None or time.monotonic() - self.pss_time >= PSS_INTERVAL)
+        if not pss:
+            self.pss = {}
+            self.pss_time = None
+        pss_now: dict[int, int] = {}
         current: dict[int, tuple[int, int, int, int]] = {}
         by_name: dict[str, dict] = {}
         names: dict[int, str] = {}
@@ -1466,52 +1505,63 @@ class ProcessSampler:
                 io_write = rate(write_bytes, prev[3], elapsed)
             name = self.names.get(pid) or display_name(pid, comm)
             names[pid] = name
+            measured = read_pss(pid) if refresh_pss else self.pss.get(pid) if pss else None
+            if measured is not None:
+                pss_now[pid] = measured
             agg = by_name.get(name)
             if agg is None:
-                agg = by_name[name] = {"name": name, "pid": pid, "cpu": 0.0, "mem": 0, "read": 0.0, "write": 0.0, "count": 0}
+                agg = by_name[name] = {"name": name, "pid": pid, "cpu": 0.0, "mem": 0, "read": 0.0, "write": 0.0, "count": 0,
+                                       "pss": 0, "pssCount": 0}
             agg["cpu"] += max(0.0, cpu)
             agg["mem"] += rss
             agg["read"] += io_read
             agg["write"] += io_write
             agg["count"] += 1
+            # PSS where readable, RSS otherwise (another user's process).
+            agg["pss"] += rss if measured is None else measured
+            agg["pssCount"] += measured is not None
         self.prev = current
         self.names = names
+        if pss:
+            self.pss = pss_now
+            if refresh_pss:
+                self.pss_time = time.monotonic()
         groups = list(by_name.values())
+
+        def entry(g: dict) -> dict:
+            out = {
+                "name": g["name"], "pid": g["pid"], "count": g["count"],
+                "cpu": round(g["cpu"], 1), "mem": g["mem"], "read": g["read"], "write": g["write"],
+            }
+            if pss:
+                out["pss"] = g["pss"]
+                out["pssCount"] = g["pssCount"]
+            return out
 
         def trim(items: list[dict], key: str) -> list[dict]:
             out = []
             for item in items[:PROC_LIMIT]:
                 if item[key] <= 0:
                     break
-                out.append({
-                    "name": item["name"], "pid": item["pid"], "count": item["count"],
-                    "cpu": round(item["cpu"], 1), "mem": item["mem"],
-                    "read": item["read"], "write": item["write"],
-                })
+                out.append(entry(item))
             return out
 
         by_cpu = sorted(groups, key=lambda g: g["cpu"], reverse=True)
+        resident = "pss" if pss else "mem"
         result = {
             "cpu": trim(by_cpu, "cpu"),
-            "mem": trim(sorted(groups, key=lambda g: g["mem"], reverse=True), "mem"),
+            "mem": trim(sorted(groups, key=lambda g: g[resident], reverse=True), resident),
             "total": len(groups),
             "io": [
-                {
-                    "name": g["name"], "pid": g["pid"], "count": g["count"],
-                    "read": g["read"], "write": g["write"], "cpu": round(g["cpu"], 1), "mem": g["mem"],
-                }
+                entry(g)
                 for g in sorted(groups, key=lambda g: g["read"] + g["write"], reverse=True)[:PROC_LIMIT]
                 if g["read"] + g["write"] > 0
             ],
         }
         if full:
-            result["all"] = [
-                {
-                    "name": g["name"], "pid": g["pid"], "count": g["count"],
-                    "cpu": round(g["cpu"], 1), "mem": g["mem"], "read": g["read"], "write": g["write"],
-                }
-                for g in by_cpu[:FULL_LIMIT]
-            ]
+            result["all"] = [entry(g) for g in by_cpu[:FULL_LIMIT]]
+        if pss:
+            result["pss"] = True
         return result
 
     def network_usage(self, full: bool = False) -> list[dict]:
@@ -1704,7 +1754,7 @@ def main() -> int:
     disks.sample(1.0, time.time())
     net.sample(1.0, time.time(), controller.detail > 0)
     if controller.detail:
-        procs.sample(1.0, controller.detail >= 2)
+        procs.sample(1.0, controller.detail >= 2, controller.focus == "memory")
     time.sleep(min(interval, 1.0) if not once else 0.5)
 
     last_slow: float | None = None
@@ -1744,7 +1794,7 @@ def main() -> int:
             if detail:
                 since = elapsed if last_procs is None else max(0.05, now_mono - last_procs)
                 try:
-                    procs_cache = procs.sample(since, detail >= 2)
+                    procs_cache = procs.sample(since, detail >= 2, focus == "memory")
                 except Exception as error:  # noqa: BLE001
                     procs_cache = None
                     payload["errors"].append(f"procs: {error}")

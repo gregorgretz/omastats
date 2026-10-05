@@ -7,7 +7,8 @@
 //!
 //! Control lines on stdin:
 //!     detail 0|1|2    0 = none, 1 = top processes, 2 = every process
-//!     focus <page>    page the panel shows; "network" adds per-process traffic
+//!     focus <page>    page the panel shows; "network" adds per-process traffic,
+//!                     "memory" adds per-process PSS (refreshed every 3 s)
 //!     interval <sec>  change the sampling interval (0.1 – 30)
 //!     pubip           refresh the public IP address in the background
 //!     quit            exit
@@ -128,6 +129,7 @@ fn main() {
         .and_then(|p| args.get(p + 1).cloned())
         .unwrap_or_default();
 
+    let focus_memory = focus_flag == "memory";
     let control = Arc::new(Mutex::new(Control {
         interval,
         detail: detail_flag,
@@ -153,7 +155,7 @@ fn main() {
     let _ = disks.sample(1.0, util::now_secs());
     let _ = net.sample(1.0, util::now_secs(), detail_flag > 0);
     if detail_flag > 0 {
-        let _ = procs.sample(1.0, detail_flag >= 2);
+        let _ = procs.sample(1.0, detail_flag >= 2, focus_memory);
     }
     std::thread::sleep(Duration::from_secs_f64(if once {
         0.5
@@ -208,7 +210,7 @@ fn main() {
                 let since = last_procs.map_or(elapsed, |t| {
                     tick_start.duration_since(t).as_secs_f64().max(0.05)
                 });
-                procs_cache = procs.sample(since, detail >= 2);
+                procs_cache = procs.sample(since, detail >= 2, focus == "memory");
                 last_procs = Some(tick_start);
             } else {
                 procs.reset();
